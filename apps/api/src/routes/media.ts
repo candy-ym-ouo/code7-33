@@ -97,14 +97,18 @@ export async function mediaRoutes(app: FastifyInstance) {
       throw new AppError(400, "VALIDATION_FAILED", "Uploaded object content type does not match the declared type");
     }
 
+    // Atomic claim: only one request can move quarantined -> processing. The state
+    // transition and its audit row commit in the same transaction, so a duplicate
+    // completion (retried or concurrent) loses the gate, rolls back, and can never
+    // produce a second audit row or a second enqueue.
     await transaction(async (client) => {
-      await client.query(
+      const claimed = await client.query(
         `UPDATE media_assets
          SET privacy_status = 'processing',
              privacy_report = $2::jsonb,
              failure_code = NULL,
              updated_at = now()
-         WHERE id = $1`,
+         WHERE id = $1 AND privacy_status = 'quarantined' AND deleted_at IS NULL`,
         [params.id, JSON.stringify({
           manualRegions: input.privacyRegions,
           containsPeopleOrPlates: input.containsPeopleOrPlates,
@@ -112,6 +116,7 @@ export async function mediaRoutes(app: FastifyInstance) {
           detector: "pending"
         })]
       );
+      if (!claimed.rowCount) throw conflict("Media upload was already completed");
       await recordAudit(client, {
         actorId: request.user!.id,
         action: "media.processing_requested",
@@ -122,10 +127,15 @@ export async function mediaRoutes(app: FastifyInstance) {
     });
 
     try {
+      // Deterministic job id: BullMQ deduplicates repeats of the same completion.
       await enqueueMediaProcessing(params.id, `media-${params.id}`);
     } catch (error) {
+      // Only roll back a status we still own; never clobber a state the worker
+      // has already advanced (e.g. scanning) if the enqueue actually succeeded.
       await query(
-        "UPDATE media_assets SET privacy_status = 'failed', failure_code = 'QUEUE_UNAVAILABLE', updated_at = now() WHERE id = $1",
+        `UPDATE media_assets
+         SET privacy_status = 'failed', failure_code = 'QUEUE_UNAVAILABLE', updated_at = now()
+         WHERE id = $1 AND privacy_status = 'processing'`,
         [params.id]
       );
       throw new AppError(503, "QUEUE_UNAVAILABLE", "Media processing queue is unavailable. Retry later.");
@@ -161,12 +171,22 @@ export async function mediaRoutes(app: FastifyInstance) {
     if (!row) throw notFound("Media not found");
     if (row.owner_id !== request.user!.id && !["moderator", "admin"].includes(request.user!.role)) throw forbidden();
     if (!["failed", "rejected"].includes(row.privacy_status)) throw conflict("Only failed media can be retried");
-    await query("UPDATE media_assets SET privacy_status = 'processing', failure_code = NULL, updated_at = now() WHERE id = $1", [params.id]);
+    // Atomic claim: concurrent retries race on this conditional transition, so only
+    // one of them can enqueue a new processing job.
+    const claimed = await query(
+      `UPDATE media_assets
+       SET privacy_status = 'processing', failure_code = NULL, updated_at = now()
+       WHERE id = $1 AND deleted_at IS NULL AND privacy_status IN ('failed', 'rejected')`,
+      [params.id]
+    );
+    if (!claimed.rowCount) throw conflict("Only failed media can be retried");
     try {
       await enqueueMediaProcessing(params.id, `media-${params.id}-${Date.now()}`);
     } catch (error) {
       await query(
-        "UPDATE media_assets SET privacy_status = 'failed', failure_code = 'QUEUE_UNAVAILABLE', updated_at = now() WHERE id = $1",
+        `UPDATE media_assets
+         SET privacy_status = 'failed', failure_code = 'QUEUE_UNAVAILABLE', updated_at = now()
+         WHERE id = $1 AND privacy_status = 'processing'`,
         [params.id]
       );
       throw new AppError(503, "QUEUE_UNAVAILABLE", "Media processing queue is unavailable. Retry later.");
