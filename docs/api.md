@@ -62,6 +62,8 @@
 | `POST` | `/media/:id/retry` | 重试失败处理 |
 | `DELETE` | `/media/:id` | 删除媒体对象 |
 
+`POST /media/uploads/:id/complete` 是幂等的：完成请求的对象校验、`quarantined → processing` 状态转换、审计记录与处理任务投递收敛在同一行锁事务边界内。并发或重试的重复完成请求只会得到当前状态（如 `{"status":"processing"}`），不会重复校验隔离对象、重复写审计或重复入队。`POST /media/:id/retry` 对同一次失败的并发重试同样只转换状态并入队一次。
+
 ## 评论、举报和通知
 
 | 方法 | 路径 | 说明 |

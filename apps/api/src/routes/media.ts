@@ -65,46 +65,61 @@ export async function mediaRoutes(app: FastifyInstance) {
   app.post("/media/uploads/:id/complete", { preHandler: requireVerifiedContributor }, async (request) => {
     const params = z.object({ id: z.string().uuid() }).parse(request.params);
     const input = mediaUploadCompleteSchema.parse(request.body);
-    const result = await query<{
-      id: string;
-      owner_id: string;
-      byte_size: string;
-      mime_type: string;
-      quarantine_object_key: string;
-      privacy_status: string;
-    }>(
-      `SELECT id, owner_id, byte_size, mime_type, quarantine_object_key, privacy_status
-       FROM media_assets WHERE id = $1 AND deleted_at IS NULL`,
-      [params.id]
-    );
-    const media = result.rows[0];
-    if (!media) throw notFound("Media not found");
-    if (media.owner_id !== request.user!.id) throw forbidden();
-    if (media.privacy_status !== "quarantined") throw conflict("Media upload was already completed");
 
-    let metadata;
-    try {
-      metadata = await getQuarantineMetadata(media.quarantine_object_key);
-    } catch {
-      throw new AppError(409, "CONFLICT", "Uploaded object was not found in quarantine storage");
-    }
-    const actualBytes = Number(metadata.ContentLength ?? 0);
-    const actualContentType = metadata.ContentType?.split(";")[0]?.trim();
-    if (!actualBytes || actualBytes > config.MEDIA_MAX_BYTES || actualBytes !== Number(media.byte_size)) {
-      throw new AppError(400, "VALIDATION_FAILED", "Uploaded object size does not match the declared size");
-    }
-    if (actualContentType && actualContentType !== media.mime_type) {
-      throw new AppError(400, "VALIDATION_FAILED", "Uploaded object content type does not match the declared type");
-    }
+    // All database-visible side effects of completion converge on one row-lock
+    // idempotency boundary: object validation, the quarantined -> processing
+    // transition and the audit record commit (or are rejected) together, so a
+    // retried or racing duplicate request can never validate twice or audit twice.
+    // Job dispatch follows the commit with a deterministic job id, which collapses
+    // any duplicate delivery to the single existing BullMQ job.
+    const currentStatus = await transaction(async (client) => {
+      const result = await client.query<{
+        owner_id: string;
+        byte_size: string;
+        mime_type: string;
+        quarantine_object_key: string;
+        privacy_status: string;
+      }>(
+        `SELECT owner_id, byte_size, mime_type, quarantine_object_key, privacy_status
+         FROM media_assets WHERE id = $1 AND deleted_at IS NULL
+         FOR UPDATE`,
+        [params.id]
+      );
+      const media = result.rows[0];
+      if (!media) throw notFound("Media not found");
+      if (media.owner_id !== request.user!.id) throw forbidden();
 
-    await transaction(async (client) => {
+      // The row lock serializes concurrent completions. A second caller observes the
+      // already-claimed state and is answered idempotently without any side effect.
+      if (media.privacy_status !== "quarantined") {
+        return media.privacy_status;
+      }
+
+      // Object verification runs while holding the claim lock, inside the same
+      // transaction: on failure nothing is transitioned and nothing is audited, and
+      // duplicate requests never reach object storage at all.
+      let metadata;
+      try {
+        metadata = await getQuarantineMetadata(media.quarantine_object_key);
+      } catch {
+        throw new AppError(409, "CONFLICT", "Uploaded object was not found in quarantine storage");
+      }
+      const actualBytes = Number(metadata.ContentLength ?? 0);
+      const actualContentType = metadata.ContentType?.split(";")[0]?.trim();
+      if (!actualBytes || actualBytes > config.MEDIA_MAX_BYTES || actualBytes !== Number(media.byte_size)) {
+        throw new AppError(400, "VALIDATION_FAILED", "Uploaded object size does not match the declared size");
+      }
+      if (actualContentType && actualContentType !== media.mime_type) {
+        throw new AppError(400, "VALIDATION_FAILED", "Uploaded object content type does not match the declared type");
+      }
+
       await client.query(
         `UPDATE media_assets
          SET privacy_status = 'processing',
              privacy_report = $2::jsonb,
              failure_code = NULL,
              updated_at = now()
-         WHERE id = $1`,
+         WHERE id = $1 AND privacy_status = 'quarantined'`,
         [params.id, JSON.stringify({
           manualRegions: input.privacyRegions,
           containsPeopleOrPlates: input.containsPeopleOrPlates,
@@ -119,18 +134,23 @@ export async function mediaRoutes(app: FastifyInstance) {
         resourceId: params.id,
         metadata: { regionCount: input.privacyRegions.length }
       });
+      return "processing";
     });
 
+    // Deterministic job id: a duplicate completion (e.g. a retried request after a
+    // commit/enqueue failure window) is collapsed by BullMQ onto the existing job.
+    // If Redis is unavailable, mark the claim failed so the upload stays retryable
+    // via POST /media/:id/retry instead of being stranded in 'processing'.
     try {
       await enqueueMediaProcessing(params.id, `media-${params.id}`);
-    } catch (error) {
+    } catch {
       await query(
         "UPDATE media_assets SET privacy_status = 'failed', failure_code = 'QUEUE_UNAVAILABLE', updated_at = now() WHERE id = $1",
         [params.id]
       );
       throw new AppError(503, "QUEUE_UNAVAILABLE", "Media processing queue is unavailable. Retry later.");
     }
-    return { status: "processing" };
+    return { status: currentStatus };
   });
 
   app.get("/media/:id", { preHandler: requireAuth }, async (request) => {
@@ -153,18 +173,43 @@ export async function mediaRoutes(app: FastifyInstance) {
 
   app.post("/media/:id/retry", { preHandler: requireVerifiedContributor }, async (request) => {
     const params = z.object({ id: z.string().uuid() }).parse(request.params);
-    const result = await query<{ owner_id: string; privacy_status: string }>(
-      "SELECT owner_id, privacy_status FROM media_assets WHERE id = $1 AND deleted_at IS NULL",
-      [params.id]
-    );
-    const row = result.rows[0];
-    if (!row) throw notFound("Media not found");
-    if (row.owner_id !== request.user!.id && !["moderator", "admin"].includes(request.user!.role)) throw forbidden();
-    if (!["failed", "rejected"].includes(row.privacy_status)) throw conflict("Only failed media can be retried");
-    await query("UPDATE media_assets SET privacy_status = 'processing', failure_code = NULL, updated_at = now() WHERE id = $1", [params.id]);
+
+    // Same FOR UPDATE claim boundary as upload completion: racing retries serialize
+    // on the row lock and only one can perform the failed/rejected -> processing
+    // transition, so the processing job is enqueued at most once per retry generation.
+    const claim = await transaction(async (client) => {
+      const result = await client.query<{ owner_id: string; privacy_status: string }>(
+        `SELECT owner_id, privacy_status FROM media_assets
+         WHERE id = $1 AND deleted_at IS NULL
+         FOR UPDATE`,
+        [params.id]
+      );
+      const row = result.rows[0];
+      if (!row) throw notFound("Media not found");
+      if (row.owner_id !== request.user!.id && !["moderator", "admin"].includes(request.user!.role)) throw forbidden();
+      if (!["failed", "rejected"].includes(row.privacy_status)) {
+        // A concurrent retry already claimed the asset; answer idempotently instead
+        // of performing a second transition/enqueue.
+        return { status: row.privacy_status, jobId: null as string | null };
+      }
+      const transitioned = await client.query<{ updated_at: Date }>(
+        `UPDATE media_assets
+         SET privacy_status = 'processing', failure_code = NULL, updated_at = now()
+         WHERE id = $1 AND privacy_status IN ('failed', 'rejected')
+         RETURNING updated_at`,
+        [params.id]
+      );
+      // The transition timestamp identifies this retry generation: concurrent
+      // duplicates of the same click share it and collapse to one job, while each
+      // later retry gets a fresh id instead of reusing the previous failed job.
+      return { status: "processing", jobId: `media-${params.id}-retry-${transitioned.rows[0]!.updated_at.getTime()}` };
+    });
+    if (claim.status !== "processing" || !claim.jobId) {
+      return { status: claim.status };
+    }
     try {
-      await enqueueMediaProcessing(params.id, `media-${params.id}-${Date.now()}`);
-    } catch (error) {
+      await enqueueMediaProcessing(params.id, claim.jobId);
+    } catch {
       await query(
         "UPDATE media_assets SET privacy_status = 'failed', failure_code = 'QUEUE_UNAVAILABLE', updated_at = now() WHERE id = $1",
         [params.id]
